@@ -14,7 +14,11 @@ const orderSchema = new mongoose.Schema(
     ],
     deliveryAddress: {
       address: String,
-      contactPhone: { type: String, required: true }, // required contact for this order
+      // Not enforced with `required: true` at the schema level on purpose:
+      // that would break re-saving OLDER orders (created before this field
+      // existed) whenever their status changes. It's still required at
+      // order-creation time via an explicit check in createOrder.
+      contactPhone: String,
       contactPhone2: String, // optional backup contact for this order
       location: {
         type: { type: String, enum: ['Point'], default: 'Point' },
