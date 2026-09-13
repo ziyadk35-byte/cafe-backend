@@ -1,13 +1,17 @@
+const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
 const User = require('../models/User');
 const Settings = require('../models/Settings');
-const { findNearestBranch, haversineDistance } = require('../utils/geoUtils');
+const SubscriptionPayment = require('../models/SubscriptionPayment');
+const { findNearestBranch } = require('../utils/geoUtils');
 const { createPaymobPayment } = require('../utils/paymob');
 const { sendPushNotification } = require('../utils/push');
+const { getBaseSellingPrice, roundMoney } = require('../utils/pricing');
+const { verifyPaymobHmac } = require('../utils/paymobHmac');
 
-const CANCEL_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
+const CANCEL_WINDOW_MS = 2 * 60 * 1000;
 
 const STATUS_MESSAGES = {
   confirmed: 'طلبك اتأكد وهيدخل التحضير 👌',
@@ -17,13 +21,35 @@ const STATUS_MESSAGES = {
   cancelled: 'اتلغى الطلب',
 };
 
-// Create a new order: resolves nearest branch by GPS, calculates total,
-// applies loyalty/coupon discounts, and either marks as cash-pending or
-// creates a Paymob payment session.
+async function finalizeOrderRewards(order) {
+  if (order.rewardsFinalized || order.status !== 'delivered') return;
+
+  const user = await User.findById(order.customer);
+  if (!user) return;
+  const settings = await Settings.getGlobal();
+
+  if (order.discountAmount > 0) user.loyaltyDiscountUsed = true;
+
+  if (order.pointsDiscountAmount > 0 && user.loyaltyPoints >= settings.pointsThreshold) {
+    user.loyaltyPoints -= settings.pointsThreshold;
+  }
+
+  const earned = Math.floor((order.subtotal || 0) / 10);
+  user.loyaltyPoints += earned;
+  order.pointsEarned = earned;
+
+  if (order.couponCode) {
+    await Coupon.updateOne({ code: order.couponCode }, { $inc: { usedCount: 1 } });
+  }
+
+  order.rewardsFinalized = true;
+  await user.save();
+  await order.save();
+}
+
 exports.createOrder = async (req, res) => {
   try {
     const { items, deliveryAddress, paymentMethod, notes, couponCode, redeemPoints } = req.body;
-    // deliveryAddress: { address, lat, lng, contactPhone, contactPhone2 }
 
     if (!items || items.length === 0) {
       return res.status(400).json({ message: 'Order must contain at least one item' });
@@ -33,12 +59,11 @@ exports.createOrder = async (req, res) => {
     }
 
     const branchResult = await findNearestBranch(deliveryAddress.lng, deliveryAddress.lat);
-    if (!branchResult || !branchResult.branch) {
+    if (!branchResult?.branch) {
       return res.status(400).json({ message: 'No branch delivers to this location' });
     }
     const branch = branchResult.branch;
 
-    // Build order items with price snapshot from DB (never trust client prices)
     let subtotal = 0;
     const orderItems = [];
     for (const item of items) {
@@ -46,75 +71,59 @@ exports.createOrder = async (req, res) => {
       if (!product || !product.isAvailable) {
         return res.status(400).json({ message: `Product unavailable: ${item.productId}` });
       }
-      const lineTotal = product.price * item.quantity;
-      subtotal += lineTotal;
-      orderItems.push({
-        product: product._id,
-        name: product.name,
-        price: product.price,
-        quantity: item.quantity,
-      });
+      if (
+        product.availableBranches?.length > 0 &&
+        !product.availableBranches.some((id) => String(id) === String(branch._id))
+      ) {
+        return res.status(400).json({ message: `Product unavailable in this branch: ${product.name}` });
+      }
+      const unitPrice = getBaseSellingPrice(product);
+      subtotal += unitPrice * item.quantity;
+      orderItems.push({ product: product._id, name: product.name, nameEn: product.nameEn, price: unitPrice, quantity: item.quantity });
     }
+    subtotal = roundMoney(subtotal);
 
-    const deliveryFee = branch.deliveryFee ?? 25; // per-branch fee set by admin
+    const deliveryFee = branch.deliveryFee ?? 25;
 
-    // Loyalty discount: 20% off, granted once, on the customer's 2nd
-    // completed order. We check completed orders BEFORE this one.
     const previousOrdersCount = await Order.countDocuments({
       customer: req.user._id,
-      $or: [{ paymentMethod: 'cash' }, { paymentStatus: 'paid' }],
-      status: { $ne: 'cancelled' },
+      status: 'delivered',
     });
 
     let discountAmount = 0;
-    const eligibleForLoyaltyDiscount = previousOrdersCount === 1 && !req.user.loyaltyDiscountUsed;
-    if (eligibleForLoyaltyDiscount) {
-      discountAmount = Math.round(subtotal * 0.2 * 100) / 100;
+    if (previousOrdersCount === 1 && !req.user.loyaltyDiscountUsed) {
+      discountAmount = roundMoney(subtotal * 0.2);
     }
 
-    // Coupon discount (stacks with loyalty discount if both somehow apply,
-    // but in practice you'd usually only expect one to be used per order)
     let couponDiscountAmount = 0;
     let appliedCoupon = null;
     if (couponCode) {
       appliedCoupon = await Coupon.findOne({ code: couponCode.toUpperCase() });
       if (
-        appliedCoupon &&
-        appliedCoupon.isActive &&
+        appliedCoupon && appliedCoupon.isActive &&
         (!appliedCoupon.expiresAt || appliedCoupon.expiresAt > new Date()) &&
         (!appliedCoupon.usageLimit || appliedCoupon.usedCount < appliedCoupon.usageLimit)
       ) {
-        couponDiscountAmount = Math.round(subtotal * (appliedCoupon.discountPercent / 100) * 100) / 100;
+        couponDiscountAmount = roundMoney(subtotal * (appliedCoupon.discountPercent / 100));
       } else {
-        appliedCoupon = null; // invalid/expired - silently ignore, don't fail the order
+        appliedCoupon = null;
       }
     }
 
-    const total = subtotal - discountAmount - couponDiscountAmount + deliveryFee;
-
-    // Monthly subscription discount: a flat % off the products subtotal
-    // while the customer's subscription is active.
     const settings = await Settings.getGlobal();
-    let subscriptionDiscountAmount = 0;
     const hasActiveSubscription =
       req.user.subscriptionExpiresAt && req.user.subscriptionExpiresAt > new Date();
-    if (hasActiveSubscription) {
-      subscriptionDiscountAmount =
-        Math.round(subtotal * (settings.subscriptionDiscountPercent / 100) * 100) / 100;
-    }
+    const subscriptionDiscountAmount = hasActiveSubscription
+      ? roundMoney(subtotal * (settings.subscriptionDiscountPercent / 100))
+      : 0;
 
-    // Loyalty points redemption: customer chose to cash in their points for
-    // a flat EGP discount (only if they actually have enough points).
-    let pointsDiscountAmount = 0;
-    const canRedeemPoints = redeemPoints && req.user.loyaltyPoints >= settings.pointsThreshold;
-    if (canRedeemPoints) {
-      pointsDiscountAmount = settings.pointsDiscountAmount;
-    }
+    const canRedeemPoints = !!redeemPoints && req.user.loyaltyPoints >= settings.pointsThreshold;
+    const pointsDiscountAmount = canRedeemPoints ? settings.pointsDiscountAmount : 0;
 
-    const finalTotal = Math.max(
+    const finalTotal = roundMoney(Math.max(
       0,
-      total - subscriptionDiscountAmount - pointsDiscountAmount
-    );
+      subtotal - discountAmount - couponDiscountAmount - subscriptionDiscountAmount - pointsDiscountAmount + deliveryFee
+    ));
 
     const order = await Order.create({
       customer: req.user._id,
@@ -128,47 +137,31 @@ exports.createOrder = async (req, res) => {
       },
       subtotal,
       discountAmount,
-      couponCode: appliedCoupon ? appliedCoupon.code : undefined,
+      couponCode: appliedCoupon?.code,
       couponDiscountAmount,
       subscriptionDiscountAmount,
       pointsDiscountAmount,
       deliveryFee,
       total: finalTotal,
       paymentMethod,
+      availableToBranchAt: paymentMethod === 'cash' ? new Date() : undefined,
       notes,
     });
 
-    if (discountAmount > 0) {
-      req.user.loyaltyDiscountUsed = true;
-    }
-    if (canRedeemPoints) {
-      req.user.loyaltyPoints -= settings.pointsThreshold;
-    }
-    // Earn 1 point per 10 EGP spent on this order (based on subtotal, before
-    // delivery fee, so delivery cost itself doesn't earn points).
-    req.user.loyaltyPoints += Math.floor(subtotal / 10);
-    await req.user.save();
-
-    if (appliedCoupon) {
-      appliedCoupon.usedCount += 1;
-      await appliedCoupon.save();
-    }
-
     let paymentInfo = null;
     if (paymentMethod === 'paymob') {
-      const { paymobOrderId, iframeUrl } = await createPaymobPayment({
+      const payment = await createPaymobPayment({
         amountCents: Math.round(finalTotal * 100),
         orderId: order._id,
         customer: { name: req.user.name, email: req.user.email, phone: req.user.phone },
       });
-      order.paymobOrderId = paymobOrderId;
+      order.paymobOrderId = String(payment.paymobOrderId);
       await order.save();
-      paymentInfo = { iframeUrl };
+      paymentInfo = { iframeUrl: payment.iframeUrl };
+    } else {
+      const io = req.app.get('io');
+      io.to(`branch_${branch._id}`).emit('new_order', order);
     }
-
-    // Notify the branch in real time via Socket.io
-    const io = req.app.get('io');
-    io.to(`branch_${branch._id}`).emit('new_order', order);
 
     res.status(201).json({ order, paymentInfo });
   } catch (err) {
@@ -181,83 +174,63 @@ exports.getMyOrders = async (req, res) => {
   res.json(orders);
 };
 
-// Used to know if a phone number has ordered before (basis for "20% off your
-// next order" style loyalty discounts). Counts only successfully paid/confirmed
-// orders so abandoned/failed orders don't count.
 exports.getCustomerOrderHistory = async (req, res) => {
   try {
-    const completedOrdersCount = await Order.countDocuments({
-      customer: req.user._id,
-      $or: [{ paymentMethod: 'cash' }, { paymentStatus: 'paid' }],
-      status: { $ne: 'cancelled' },
-    });
-
+    const completedOrdersCount = await Order.countDocuments({ customer: req.user._id, status: 'delivered' });
     res.json({
       phone: req.user.phone,
       completedOrdersCount,
       isReturningCustomer: completedOrdersCount > 0,
+      eligibleSecondOrderDiscount: completedOrdersCount === 1 && !req.user.loyaltyDiscountUsed,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
+function populatedOrderQuery(query) {
+  return query
+    .populate('customer', 'name phone phone2')
+    .populate('driver', 'name phone')
+    .populate('confirmedBy', 'name')
+    .populate('preparingBy', 'name')
+    .populate('dispatchedBy', 'name');
+}
+
 exports.getBranchOrders = async (req, res) => {
-  // branch_staff/driver can only see orders for the branch they belong to
   if (req.user.role !== 'admin' && String(req.user.branch) !== req.params.branchId) {
     return res.status(403).json({ message: 'You can only view orders for your own branch' });
   }
-  const orders = await Order.find({ branch: req.params.branchId })
-    .sort('-createdAt')
-    .populate('customer', 'name phone phone2')
-    .populate('driver', 'name phone')
-    .populate('confirmedBy', 'name');
+  const orders = await populatedOrderQuery(Order.find({ branch: req.params.branchId }).sort('-createdAt'));
   res.json(orders);
 };
 
-// Full detail for a single order - used by the cashier/admin "order details"
-// view (customer info, who confirmed it, who delivered it, delivery photo).
 exports.getOrderById = async (req, res) => {
   try {
-    const order = await Order.findById(req.params.id)
-      .populate('customer', 'name phone phone2')
-      .populate('driver', 'name phone')
-      .populate('confirmedBy', 'name');
+    const order = await populatedOrderQuery(Order.findById(req.params.id));
     if (!order) return res.status(404).json({ message: 'Order not found' });
-
     if (req.user.role !== 'admin' && String(req.user.branch) !== String(order.branch)) {
       return res.status(403).json({ message: 'You can only view orders for your own branch' });
     }
-
     res.json(order);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Returns the driver's currently assigned active delivery (if any). Drivers
-// only ever see this one order - never the full branch order list.
 exports.getMyDelivery = async (req, res) => {
   try {
-    const order = await Order.findOne({
-      driver: req.user._id,
-      status: 'out_for_delivery',
-    }).sort('-updatedAt');
+    const order = await Order.findOne({ driver: req.user._id, status: 'out_for_delivery' }).sort('dispatchedAt');
     res.json(order || null);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Driver's past deliveries (delivered/cancelled orders that were assigned to
-// them) - shown in their own "completed orders" tab.
-exports.getMyDeliveryHistory = async (req, res) => {
+exports.getMyDeliveries = async (req, res) => {
   try {
-    const orders = await Order.find({
-      driver: req.user._id,
-      status: { $in: ['delivered', 'cancelled'] },
-    })
-      .sort('-updatedAt')
+    const orders = await Order.find({ driver: req.user._id, status: 'out_for_delivery' })
+      .sort('dispatchedAt')
       .populate('customer', 'name phone phone2');
     res.json(orders);
   } catch (err) {
@@ -265,39 +238,50 @@ exports.getMyDeliveryHistory = async (req, res) => {
   }
 };
 
-// Branch staff assigns a specific driver to an order and moves it to
-// "out_for_delivery" in one step - the driver only finds out once they're
-// actually dispatched, not before.
+exports.getMyDeliveryHistory = async (req, res) => {
+  try {
+    const orders = await Order.find({
+      driver: req.user._id,
+      status: { $in: ['delivered', 'cancelled'] },
+    }).sort('-deliveredAt -updatedAt').populate('customer', 'name phone phone2');
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 exports.dispatchOrder = async (req, res) => {
   try {
     const { driverId } = req.body;
     const order = await Order.findById(req.params.id).populate('customer', 'pushToken');
     if (!order) return res.status(404).json({ message: 'Order not found' });
-
     if (req.user.role !== 'admin' && String(req.user.branch) !== String(order.branch)) {
       return res.status(403).json({ message: 'You can only dispatch orders for your own branch' });
     }
 
-    const driver = await User.findOne({ _id: driverId, role: 'driver', branch: order.branch });
-    if (!driver) {
-      return res.status(400).json({ message: 'الدليفري ده مش موجود في نفس الفرع' });
-    }
+    const driver = await User.findOne({
+      _id: driverId,
+      role: 'driver',
+      branch: order.branch,
+      isActive: true,
+    });
+    if (!driver) return res.status(400).json({ message: 'الدليفري ده مش موجود أو موقوف في نفس الفرع' });
 
     order.driver = driver._id;
     order.status = 'out_for_delivery';
     order.dispatchedAt = new Date();
+    order.dispatchedBy = req.user._id;
     await order.save();
 
     const io = req.app.get('io');
-    io.to(`order_${order._id}`).emit('order_status_updated', { orderId: order._id, status: 'out_for_delivery' });
-    io.to(`customer_${order.customer._id}`).emit('order_status_updated', { orderId: order._id, status: 'out_for_delivery' });
+    const payload = { orderId: order._id, status: 'out_for_delivery' };
+    io.to(`order_${order._id}`).emit('order_status_updated', payload);
+    io.to(`customer_${order.customer._id}`).emit('order_status_updated', payload);
+    io.to(`branch_${order.branch}`).emit('order_status_updated', payload);
 
     if (order.customer.pushToken) {
-      sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES.out_for_delivery, {
-        orderId: String(order._id),
-      });
+      sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES.out_for_delivery, { orderId: String(order._id) });
     }
-
     res.json(order);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -307,23 +291,15 @@ exports.dispatchOrder = async (req, res) => {
 exports.updateOrderStatus = async (req, res) => {
   try {
     const { status } = req.body;
-
-    // Moving to out_for_delivery must go through /dispatch so a driver gets
-    // assigned in the same step - never allow it via this generic endpoint.
     if (status === 'out_for_delivery') {
       return res.status(400).json({ message: 'استخدم تعيين دليفري عشان تنقل الطلب لمرحلة التوصيل' });
     }
 
     const order = await Order.findById(req.params.id).populate('customer', 'pushToken');
     if (!order) return res.status(404).json({ message: 'Order not found' });
-
-    // branch_staff/driver can only update orders belonging to their own branch
     if (req.user.role !== 'admin' && String(req.user.branch) !== String(order.branch)) {
       return res.status(403).json({ message: 'You can only update orders for your own branch' });
     }
-
-    // A driver may only mark THEIR OWN assigned delivery as delivered -
-    // nothing else, and no other order.
     if (req.user.role === 'driver') {
       if (status !== 'delivered' || String(order.driver) !== String(req.user._id)) {
         return res.status(403).json({ message: 'مسموحلك بس تعلّم على تسليم الطلب المعين ليك' });
@@ -331,72 +307,67 @@ exports.updateOrderStatus = async (req, res) => {
     }
 
     order.status = status;
-    if (status === 'confirmed' && !order.confirmedBy) {
+    if (status === 'confirmed' && !order.confirmedAt) {
+      order.confirmedAt = new Date();
       order.confirmedBy = req.user._id;
+    }
+    if (status === 'preparing' && !order.preparingAt) {
+      order.preparingAt = new Date();
+      order.preparingBy = req.user._id;
+    }
+    if (status === 'delivered' && !order.deliveredAt) {
+      order.deliveredAt = new Date();
+      if (order.paymentMethod === 'cash') order.paymentStatus = 'paid';
     }
     await order.save();
 
+    if (status === 'delivered') await finalizeOrderRewards(order);
+
     const io = req.app.get('io');
-    io.to(`order_${order._id}`).emit('order_status_updated', { orderId: order._id, status });
-    io.to(`customer_${order.customer._id}`).emit('order_status_updated', { orderId: order._id, status });
+    const payload = { orderId: order._id, status };
+    io.to(`order_${order._id}`).emit('order_status_updated', payload);
+    io.to(`customer_${order.customer._id}`).emit('order_status_updated', payload);
+    io.to(`branch_${order.branch}`).emit('order_status_updated', payload);
 
     if (STATUS_MESSAGES[status] && order.customer.pushToken) {
-      sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES[status], {
-        orderId: String(order._id),
-      });
+      sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES[status], { orderId: String(order._id) });
     }
-
     res.json(order);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Customer can cancel their own order within a short window right after
-// placing it, before the branch has started preparing it.
 exports.cancelOrder = async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: 'Order not found' });
-    if (String(order.customer) !== String(req.user._id)) {
-      return res.status(403).json({ message: 'This is not your order' });
-    }
+    if (String(order.customer) !== String(req.user._id)) return res.status(403).json({ message: 'This is not your order' });
     if (!['pending', 'confirmed'].includes(order.status)) {
       return res.status(400).json({ message: 'الطلب بدأ يتحضّر بالفعل، مش ممكن تلغيه دلوقتي' });
     }
-    const elapsed = Date.now() - new Date(order.createdAt).getTime();
-    if (elapsed > CANCEL_WINDOW_MS) {
+    if (Date.now() - new Date(order.createdAt).getTime() > CANCEL_WINDOW_MS) {
       return res.status(400).json({ message: 'انتهت فترة إلغاء الطلب (أول دقيقتين بس)' });
     }
 
     order.status = 'cancelled';
     await order.save();
-
     const io = req.app.get('io');
     io.to(`branch_${order.branch}`).emit('order_status_updated', { orderId: order._id, status: 'cancelled' });
-
     res.json(order);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Customer rates a delivered order
 exports.rateOrder = async (req, res) => {
   try {
     const { stars, comment } = req.body;
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: 'Order not found' });
-    if (String(order.customer) !== String(req.user._id)) {
-      return res.status(403).json({ message: 'This is not your order' });
-    }
-    if (order.status !== 'delivered') {
-      return res.status(400).json({ message: 'تقدر تقيّم بس بعد ما الطلب يوصل' });
-    }
-    if (order.rating?.stars) {
-      return res.status(400).json({ message: 'الطلب ده اتقيّم قبل كده' });
-    }
-
+    if (String(order.customer) !== String(req.user._id)) return res.status(403).json({ message: 'This is not your order' });
+    if (order.status !== 'delivered') return res.status(400).json({ message: 'تقدر تقيّم بس بعد ما الطلب يوصل' });
+    if (order.rating?.stars) return res.status(400).json({ message: 'أنت قيّمت الطلب ده قبل كده' });
     order.rating = { stars, comment, ratedAt: new Date() };
     await order.save();
     res.json(order);
@@ -405,8 +376,6 @@ exports.rateOrder = async (req, res) => {
   }
 };
 
-// Driver uploads a photo as proof of delivery (expects an already-hosted
-// image URL - e.g. uploaded to Cloudinary/S3 from the app first)
 exports.attachDeliveryPhoto = async (req, res) => {
   try {
     const { photoUrl } = req.body;
@@ -426,44 +395,32 @@ exports.attachDeliveryPhoto = async (req, res) => {
   }
 };
 
-// Driver's live location during an active delivery, broadcast to the
-// customer's tracking screen AND the branch's cashier dashboard in real time.
 exports.updateDriverLocation = async (req, res) => {
   try {
     const { lat, lng } = req.body;
+    if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) {
+      return res.status(400).json({ message: 'Valid lat/lng are required' });
+    }
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: 'Order not found' });
-
-    // Only the driver actually assigned to this delivery can push location
-    // updates for it (admin bypass kept for support/testing purposes).
     if (req.user.role === 'driver' && String(order.driver) !== String(req.user._id)) {
       return res.status(403).json({ message: 'مسموحلك بس تحدّث موقع الطلب المعين ليك' });
     }
 
-    order.driverLocation = { type: 'Point', coordinates: [lng, lat] };
+    order.driverLocation = { type: 'Point', coordinates: [Number(lng), Number(lat)] };
+    order.driverLocationUpdatedAt = new Date();
     await order.save();
 
+    const payload = { orderId: order._id, lat: Number(lat), lng: Number(lng), updatedAt: order.driverLocationUpdatedAt };
     const io = req.app.get('io');
-    io.to(`order_${order._id}`).emit('driver_location_updated', {
-      orderId: order._id,
-      lat,
-      lng,
-    });
-    // Also broadcast to the branch room so the cashier's dashboard can show
-    // the driver moving live, without needing to join each order individually.
-    io.to(`branch_${order.branch}`).emit('driver_location_updated', {
-      orderId: order._id,
-      lat,
-      lng,
-    });
-
-    res.json({ message: 'Location updated' });
+    io.to(`order_${order._id}`).emit('driver_location_updated', payload);
+    io.to(`branch_${order.branch}`).emit('driver_location_updated', payload);
+    res.json({ message: 'Location updated', driverLocationUpdatedAt: order.driverLocationUpdatedAt });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Admin: delete a single order (used for cleanup once it's completed).
 exports.deleteOrder = async (req, res) => {
   try {
     const order = await Order.findByIdAndDelete(req.params.id);
@@ -474,50 +431,76 @@ exports.deleteOrder = async (req, res) => {
   }
 };
 
-// Admin: wipe all orders for a branch on a given day (e.g. "clear today's
-// orders" once the branch closes, so tomorrow's screen starts fresh).
 exports.deleteBranchOrdersByDay = async (req, res) => {
   try {
     const { branchId } = req.params;
-    const { date } = req.query; // 'YYYY-MM-DD', defaults to today
+    const { date } = req.query;
     const day = date ? new Date(date) : new Date();
     const startOfDay = new Date(day.getFullYear(), day.getMonth(), day.getDate());
     const endOfDay = new Date(startOfDay.getTime() + 24 * 60 * 60 * 1000);
-
-    const result = await Order.deleteMany({
-      branch: branchId,
-      createdAt: { $gte: startOfDay, $lt: endOfDay },
-    });
-
+    const result = await Order.deleteMany({ branch: branchId, createdAt: { $gte: startOfDay, $lt: endOfDay } });
     res.json({ message: 'Orders deleted', deletedCount: result.deletedCount });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Paymob webhook callback (server-to-server) - verify HMAC in production
 exports.paymobWebhook = async (req, res) => {
   try {
+    if (!verifyPaymobHmac(req)) return res.status(401).json({ message: 'Invalid Paymob HMAC' });
     const { obj } = req.body;
     if (!obj) return res.status(400).end();
 
-    const merchantOrderId = obj.order?.merchant_order_id;
-    const success = obj.success;
+    const merchantOrderId = String(obj.order?.merchant_order_id || '');
+    const success = !!obj.success;
+    if (!mongoose.isValidObjectId(merchantOrderId)) return res.status(200).end();
 
-    if (merchantOrderId) {
-      const order = await Order.findById(merchantOrderId);
-      if (order) {
+    const order = await Order.findById(merchantOrderId);
+    if (order) {
+      const wasPaid = order.paymentStatus === 'paid';
+      // Never downgrade a successfully paid order if Paymob later sends a failed
+      // attempt/event for the same merchant order.
+      if (!(wasPaid && !success)) {
         order.paymentStatus = success ? 'paid' : 'failed';
-        if (success) order.status = 'confirmed';
+        if (!success && order.status === 'pending') order.status = 'cancelled';
         await order.save();
-
-        const io = req.app.get('io');
-        io.to(`branch_${order.branch}`).emit('order_payment_updated', {
-          orderId: order._id,
-          paymentStatus: order.paymentStatus,
-        });
       }
+
+      const io = req.app.get('io');
+      io.to(`branch_${order.branch}`).emit('order_payment_updated', {
+        orderId: order._id,
+        paymentStatus: order.paymentStatus,
+      });
+      if (success && !wasPaid) {
+        order.availableToBranchAt = new Date();
+        await order.save();
+        const populated = await Order.findById(order._id).populate('customer', 'name phone');
+        io.to(`branch_${order.branch}`).emit('new_order', populated);
+      }
+      return res.status(200).end();
     }
+
+    const subscriptionPayment = await SubscriptionPayment.findById(merchantOrderId);
+    if (subscriptionPayment) {
+      const wasPaid = subscriptionPayment.paymentStatus === 'paid';
+      if (!(wasPaid && !success)) subscriptionPayment.paymentStatus = success ? 'paid' : 'failed';
+      if (success && !wasPaid && !subscriptionPayment.activatedAt) {
+        const user = await User.findById(subscriptionPayment.user);
+        if (user) {
+          const now = new Date();
+          const base = user.subscriptionExpiresAt && user.subscriptionExpiresAt > now ? user.subscriptionExpiresAt : now;
+          user.subscriptionExpiresAt = new Date(base.getTime() + 30 * 24 * 60 * 60 * 1000);
+          subscriptionPayment.activatedAt = new Date();
+          await user.save();
+          req.app.get('io').to(`customer_${user._id}`).emit('subscription_updated', {
+            subscriptionExpiresAt: user.subscriptionExpiresAt,
+          });
+        }
+      }
+      await subscriptionPayment.save();
+      return res.status(200).end();
+    }
+
     res.status(200).end();
   } catch (err) {
     res.status(500).json({ message: err.message });

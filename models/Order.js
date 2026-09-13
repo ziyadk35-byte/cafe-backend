@@ -7,7 +7,8 @@ const orderSchema = new mongoose.Schema(
     items: [
       {
         product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
-        name: String, // snapshot at order time
+        name: String, // Arabic snapshot at order time
+        nameEn: String, // English snapshot at order time
         price: Number, // snapshot at order time
         quantity: { type: Number, required: true, min: 1 },
       },
@@ -41,9 +42,16 @@ const orderSchema = new mongoose.Schema(
       enum: ['pending', 'confirmed', 'preparing', 'out_for_delivery', 'delivered', 'cancelled'],
       default: 'pending',
     },
+    availableToBranchAt: { type: Date }, // when the cashier could first see/accept it (after online payment for Paymob)
     confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // cashier/admin who confirmed the order
+    confirmedAt: { type: Date },
+    preparingAt: { type: Date },
+    preparingBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     dispatchedAt: { type: Date }, // when the driver was assigned - used to measure delivery time
+    dispatchedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    deliveredAt: { type: Date },
+    driverLocationUpdatedAt: { type: Date },
     driverLocation: {
       type: { type: String, enum: ['Point'] },
       coordinates: { type: [Number] }, // [lng, lat] - updated live during delivery
@@ -59,6 +67,8 @@ const orderSchema = new mongoose.Schema(
     subscriptionDiscountAmount: { type: Number, default: 0 },
     pointsDiscountAmount: { type: Number, default: 0 },
     notes: String,
+    rewardsFinalized: { type: Boolean, default: false },
+    pointsEarned: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

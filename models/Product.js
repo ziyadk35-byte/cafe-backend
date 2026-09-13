@@ -3,7 +3,11 @@ const mongoose = require('mongoose');
 const productSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
+    nameEn: String,
     description: String,
+    descriptionEn: String,
+    ingredients: [{ type: String }],
+    ingredientsEn: [{ type: String }],
     price: { type: Number, required: true },
     // 'hot' (سخن), 'cold' (ساقع), 'food' (أكل) - drives the category chips in the app
     category: { type: String, enum: ['hot', 'cold', 'food'], default: 'hot' },

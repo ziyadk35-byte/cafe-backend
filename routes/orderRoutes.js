@@ -5,6 +5,7 @@ const {
   getBranchOrders,
   getOrderById,
   getMyDelivery,
+  getMyDeliveries,
   getMyDeliveryHistory,
   dispatchOrder,
   updateOrderStatus,
@@ -27,6 +28,7 @@ router.get('/my/history', protect, getCustomerOrderHistory);
 router.get('/branch/:branchId', protect, restrictTo('branch_staff', 'admin'), getBranchOrders);
 router.delete('/branch/:branchId/day', protect, restrictTo('admin'), deleteBranchOrdersByDay);
 router.get('/driver/my-delivery', protect, restrictTo('driver'), getMyDelivery);
+router.get('/driver/my-deliveries', protect, restrictTo('driver'), getMyDeliveries);
 router.get('/driver/history', protect, restrictTo('driver'), getMyDeliveryHistory);
 router.get('/:id', protect, restrictTo('branch_staff', 'admin'), getOrderById);
 router.delete('/:id', protect, restrictTo('admin'), deleteOrder);
