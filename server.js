@@ -16,6 +16,7 @@ const staffRoutes = require('./routes/staffRoutes');
 const couponRoutes = require('./routes/couponRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const uploadRoutes = require('./routes/uploadRoutes');
+const loyaltyRoutes = require('./routes/loyaltyRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -45,6 +46,7 @@ app.use('/api/staff', staffRoutes);
 app.use('/api/coupons', couponRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/uploads', uploadRoutes);
+app.use('/api/loyalty', loyaltyRoutes);
 
 // 404 handler
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));

@@ -18,6 +18,8 @@ const userSchema = new mongoose.Schema(
     otpCode: { type: String, select: false },
     otpExpires: { type: Date, select: false },
     loyaltyDiscountUsed: { type: Boolean, default: false }, // 20% off 2nd order, one-time
+    loyaltyPoints: { type: Number, default: 0 }, // 1 point per 10 EGP spent
+    subscriptionExpiresAt: { type: Date }, // active monthly discount subscription
     isActive: { type: Boolean, default: true }, // for disabling staff accounts
     pushToken: String, // Expo push notification token
     addresses: [

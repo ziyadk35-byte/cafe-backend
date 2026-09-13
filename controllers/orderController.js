@@ -2,6 +2,7 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Coupon = require('../models/Coupon');
 const User = require('../models/User');
+const Settings = require('../models/Settings');
 const { findNearestBranch, haversineDistance } = require('../utils/geoUtils');
 const { createPaymobPayment } = require('../utils/paymob');
 const { sendPushNotification } = require('../utils/push');
@@ -21,7 +22,7 @@ const STATUS_MESSAGES = {
 // creates a Paymob payment session.
 exports.createOrder = async (req, res) => {
   try {
-    const { items, deliveryAddress, paymentMethod, notes, couponCode } = req.body;
+    const { items, deliveryAddress, paymentMethod, notes, couponCode, redeemPoints } = req.body;
     // deliveryAddress: { address, lat, lng, contactPhone, contactPhone2 }
 
     if (!items || items.length === 0) {
@@ -91,6 +92,30 @@ exports.createOrder = async (req, res) => {
 
     const total = subtotal - discountAmount - couponDiscountAmount + deliveryFee;
 
+    // Monthly subscription discount: a flat % off the products subtotal
+    // while the customer's subscription is active.
+    const settings = await Settings.getGlobal();
+    let subscriptionDiscountAmount = 0;
+    const hasActiveSubscription =
+      req.user.subscriptionExpiresAt && req.user.subscriptionExpiresAt > new Date();
+    if (hasActiveSubscription) {
+      subscriptionDiscountAmount =
+        Math.round(subtotal * (settings.subscriptionDiscountPercent / 100) * 100) / 100;
+    }
+
+    // Loyalty points redemption: customer chose to cash in their points for
+    // a flat EGP discount (only if they actually have enough points).
+    let pointsDiscountAmount = 0;
+    const canRedeemPoints = redeemPoints && req.user.loyaltyPoints >= settings.pointsThreshold;
+    if (canRedeemPoints) {
+      pointsDiscountAmount = settings.pointsDiscountAmount;
+    }
+
+    const finalTotal = Math.max(
+      0,
+      total - subscriptionDiscountAmount - pointsDiscountAmount
+    );
+
     const order = await Order.create({
       customer: req.user._id,
       branch: branch._id,
@@ -105,16 +130,25 @@ exports.createOrder = async (req, res) => {
       discountAmount,
       couponCode: appliedCoupon ? appliedCoupon.code : undefined,
       couponDiscountAmount,
+      subscriptionDiscountAmount,
+      pointsDiscountAmount,
       deliveryFee,
-      total,
+      total: finalTotal,
       paymentMethod,
       notes,
     });
 
     if (discountAmount > 0) {
       req.user.loyaltyDiscountUsed = true;
-      await req.user.save();
     }
+    if (canRedeemPoints) {
+      req.user.loyaltyPoints -= settings.pointsThreshold;
+    }
+    // Earn 1 point per 10 EGP spent on this order (based on subtotal, before
+    // delivery fee, so delivery cost itself doesn't earn points).
+    req.user.loyaltyPoints += Math.floor(subtotal / 10);
+    await req.user.save();
+
     if (appliedCoupon) {
       appliedCoupon.usedCount += 1;
       await appliedCoupon.save();
@@ -123,7 +157,7 @@ exports.createOrder = async (req, res) => {
     let paymentInfo = null;
     if (paymentMethod === 'paymob') {
       const { paymobOrderId, iframeUrl } = await createPaymobPayment({
-        amountCents: Math.round(total * 100),
+        amountCents: Math.round(finalTotal * 100),
         orderId: order._id,
         customer: { name: req.user.name, email: req.user.email, phone: req.user.phone },
       });
@@ -251,6 +285,7 @@ exports.dispatchOrder = async (req, res) => {
 
     order.driver = driver._id;
     order.status = 'out_for_delivery';
+    order.dispatchedAt = new Date();
     await order.save();
 
     const io = req.app.get('io');

@@ -43,6 +43,7 @@ const orderSchema = new mongoose.Schema(
     },
     confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // cashier/admin who confirmed the order
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    dispatchedAt: { type: Date }, // when the driver was assigned - used to measure delivery time
     driverLocation: {
       type: { type: String, enum: ['Point'] },
       coordinates: { type: [Number] }, // [lng, lat] - updated live during delivery
@@ -55,6 +56,8 @@ const orderSchema = new mongoose.Schema(
     },
     couponCode: String,
     couponDiscountAmount: { type: Number, default: 0 },
+    subscriptionDiscountAmount: { type: Number, default: 0 },
+    pointsDiscountAmount: { type: Number, default: 0 },
     notes: String,
   },
   { timestamps: true }
