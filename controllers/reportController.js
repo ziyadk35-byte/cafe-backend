@@ -80,7 +80,7 @@ exports.getTopPerformers = async (req, res) => {
           ...matchStage,
           status: 'delivered',
           driver: { $ne: null },
-          dispatchedAt: { $ne: null },
+          $or: [{ driverAcceptedAt: { $ne: null } }, { dispatchedAt: { $ne: null } }],
         },
       },
       {
@@ -88,7 +88,7 @@ exports.getTopPerformers = async (req, res) => {
           driver: 1,
           deliveryMinutes: {
             $divide: [
-              { $subtract: [{ $ifNull: ['$deliveredAt', '$updatedAt'] }, '$dispatchedAt'] },
+              { $subtract: [{ $ifNull: ['$deliveredAt', '$updatedAt'] }, { $ifNull: ['$driverAcceptedAt', '$dispatchedAt'] }] },
               60000,
             ],
           },

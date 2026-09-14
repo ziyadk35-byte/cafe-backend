@@ -39,7 +39,7 @@ const orderSchema = new mongoose.Schema(
     paymobOrderId: String, // reference from Paymob
     status: {
       type: String,
-      enum: ['pending', 'confirmed', 'preparing', 'out_for_delivery', 'delivered', 'cancelled'],
+      enum: ['pending', 'confirmed', 'preparing', 'assigned_to_driver', 'out_for_delivery', 'delivered', 'cancelled'],
       default: 'pending',
     },
     availableToBranchAt: { type: Date }, // when the cashier could first see/accept it (after online payment for Paymob)
@@ -48,7 +48,8 @@ const orderSchema = new mongoose.Schema(
     preparingAt: { type: Date },
     preparingBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    dispatchedAt: { type: Date }, // when the driver was assigned - used to measure delivery time
+    dispatchedAt: { type: Date }, // when the driver was assigned by cashier/admin
+    driverAcceptedAt: { type: Date }, // when the driver pressed Accept and actually started the trip
     dispatchedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     deliveredAt: { type: Date },
     driverLocationUpdatedAt: { type: Date },

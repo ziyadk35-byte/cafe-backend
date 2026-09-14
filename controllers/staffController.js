@@ -49,12 +49,12 @@ exports.listStaff = async (req, res) => {
 
   const staff = await User.find(filter).populate('branch', 'name').select('-password');
 
-  // For drivers, attach how many orders are currently out with them, so
+  // For drivers, attach how many orders are currently assigned to / out with them, so
   // whoever is dispatching can pick someone who's actually free.
   const Order = require('../models/Order');
   const driverIds = staff.filter((s) => s.role === 'driver').map((s) => s._id);
   const counts = await Order.aggregate([
-    { $match: { driver: { $in: driverIds }, status: 'out_for_delivery' } },
+    { $match: { driver: { $in: driverIds }, status: { $in: ['assigned_to_driver', 'out_for_delivery'] } } },
     { $group: { _id: '$driver', count: { $sum: 1 } } },
   ]);
   const countMap = {};
