@@ -21,6 +21,45 @@ const STATUS_MESSAGES = {
   cancelled: 'اتلغى الطلب',
 };
 
+// Picks who a brand-new order should be routed/notified to at its branch:
+// prefer a cashier who isn't currently handling another active order
+// (confirmed/preparing); if everyone's busy, just pick one at random so the
+// order isn't left unnotified.
+async function assignCashierForNewOrder(branchId) {
+  const cashiers = await User.find({ role: 'branch_staff', branch: branchId, isActive: true });
+  if (cashiers.length === 0) return null;
+
+  const busyCashierIds = new Set(
+    (
+      await Order.find({
+        branch: branchId,
+        status: { $in: ['confirmed', 'preparing'] },
+        confirmedBy: { $ne: null },
+      }).distinct('confirmedBy')
+    ).map(String)
+  );
+
+  const freeCashiers = cashiers.filter((c) => !busyCashierIds.has(String(c._id)));
+  const pool = freeCashiers.length > 0 ? freeCashiers : cashiers;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Routes+notifies the branch once an order is actually ready to be worked on
+// (immediately for cash orders, or once Paymob confirms payment).
+async function notifyBranchOfNewOrder(order, io) {
+  const cashier = await assignCashierForNewOrder(order.branch);
+  if (cashier) {
+    order.assignedCashier = cashier._id;
+    await order.save();
+    if (cashier.pushToken) {
+      sendPushNotification(cashier.pushToken, 'كافيه', 'طلب جديد وصل لفرعك 🛎️', {
+        orderId: String(order._id),
+      });
+    }
+  }
+  io.to(`branch_${order.branch}`).emit('new_order', order);
+}
+
 async function finalizeOrderRewards(order) {
   if (order.rewardsFinalized || order.status !== 'delivered') return;
 
@@ -160,7 +199,7 @@ exports.createOrder = async (req, res) => {
       paymentInfo = { iframeUrl: payment.iframeUrl };
     } else {
       const io = req.app.get('io');
-      io.to(`branch_${branch._id}`).emit('new_order', order);
+      await notifyBranchOfNewOrder(order, io);
     }
 
     res.status(201).json({ order, paymentInfo });
@@ -220,7 +259,7 @@ exports.getOrderById = async (req, res) => {
 
 exports.getMyDelivery = async (req, res) => {
   try {
-    const order = await Order.findOne({ driver: req.user._id, status: 'out_for_delivery' }).sort('dispatchedAt');
+    const order = await Order.findOne({ driver: req.user._id, status: { $in: ['assigned_to_driver', 'out_for_delivery'] } }).sort('dispatchedAt');
     res.json(order || null);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -229,7 +268,7 @@ exports.getMyDelivery = async (req, res) => {
 
 exports.getMyDeliveries = async (req, res) => {
   try {
-    const orders = await Order.find({ driver: req.user._id, status: 'out_for_delivery' })
+    const orders = await Order.find({ driver: req.user._id, status: { $in: ['assigned_to_driver', 'out_for_delivery'] } })
       .sort('dispatchedAt')
       .populate('customer', 'name phone phone2');
     res.json(orders);
@@ -268,13 +307,47 @@ exports.dispatchOrder = async (req, res) => {
     if (!driver) return res.status(400).json({ message: 'الدليفري ده مش موجود أو موقوف في نفس الفرع' });
 
     order.driver = driver._id;
-    order.status = 'out_for_delivery';
+    order.status = 'assigned_to_driver';
     order.dispatchedAt = new Date();
+    order.driverAcceptedAt = undefined;
     order.dispatchedBy = req.user._id;
     await order.save();
 
     const io = req.app.get('io');
-    const payload = { orderId: order._id, status: 'out_for_delivery' };
+    const payload = { orderId: order._id, status: 'assigned_to_driver' };
+    io.to(`order_${order._id}`).emit('order_status_updated', payload);
+    io.to(`customer_${order.customer._id}`).emit('order_status_updated', payload);
+    io.to(`branch_${order.branch}`).emit('order_status_updated', payload);
+
+    if (order.customer.pushToken) {
+      sendPushNotification(order.customer.pushToken, 'كافيه', 'تم تعيين مندوب لطلبك، وفي انتظار استلامه للطلب', { orderId: String(order._id) });
+    }
+    if (driver.pushToken) {
+      sendPushNotification(driver.pushToken, 'كافيه', 'اتعيّن ليك طلب جديد، افتح التطبيق تستلمه 🛵', { orderId: String(order._id) });
+    }
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.acceptDelivery = async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).populate('customer', 'pushToken name phone phone2');
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (req.user.role !== 'driver' || String(order.driver) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'الطلب ده مش معين ليك' });
+    }
+    if (order.status !== 'assigned_to_driver') {
+      return res.status(400).json({ message: 'الطلب مش في مرحلة انتظار استلام الدليفري' });
+    }
+
+    order.status = 'out_for_delivery';
+    order.driverAcceptedAt = new Date();
+    await order.save();
+
+    const io = req.app.get('io');
+    const payload = { orderId: order._id, status: 'out_for_delivery', driverAcceptedAt: order.driverAcceptedAt };
     io.to(`order_${order._id}`).emit('order_status_updated', payload);
     io.to(`customer_${order.customer._id}`).emit('order_status_updated', payload);
     io.to(`branch_${order.branch}`).emit('order_status_updated', payload);
@@ -282,7 +355,9 @@ exports.dispatchOrder = async (req, res) => {
     if (order.customer.pushToken) {
       sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES.out_for_delivery, { orderId: String(order._id) });
     }
-    res.json(order);
+
+    const populated = await Order.findById(order._id).populate('customer', 'name phone phone2');
+    res.json(populated);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -331,6 +406,12 @@ exports.updateOrderStatus = async (req, res) => {
 
     if (STATUS_MESSAGES[status] && order.customer.pushToken) {
       sendPushNotification(order.customer.pushToken, 'كافيه', STATUS_MESSAGES[status], { orderId: String(order._id) });
+    }
+    if (status === 'delivered' && order.confirmedBy) {
+      const cashier = await User.findById(order.confirmedBy);
+      if (cashier?.pushToken) {
+        sendPushNotification(cashier.pushToken, 'كافيه', 'الطلب اتسلّم للعميل ✓', { orderId: String(order._id) });
+      }
     }
     res.json(order);
   } catch (err) {
@@ -474,8 +555,7 @@ exports.paymobWebhook = async (req, res) => {
       if (success && !wasPaid) {
         order.availableToBranchAt = new Date();
         await order.save();
-        const populated = await Order.findById(order._id).populate('customer', 'name phone');
-        io.to(`branch_${order.branch}`).emit('new_order', populated);
+        await notifyBranchOfNewOrder(order, io);
       }
       return res.status(200).end();
     }

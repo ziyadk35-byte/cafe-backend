@@ -8,6 +8,7 @@ const {
   getMyDeliveries,
   getMyDeliveryHistory,
   dispatchOrder,
+  acceptDelivery,
   updateOrderStatus,
   cancelOrder,
   rateOrder,
@@ -33,6 +34,7 @@ router.get('/driver/history', protect, restrictTo('driver'), getMyDeliveryHistor
 router.get('/:id', protect, restrictTo('branch_staff', 'admin'), getOrderById);
 router.delete('/:id', protect, restrictTo('admin'), deleteOrder);
 router.patch('/:id/dispatch', protect, restrictTo('branch_staff', 'admin'), dispatchOrder);
+router.patch('/:id/accept-delivery', protect, restrictTo('driver'), acceptDelivery);
 router.patch('/:id/status', protect, restrictTo('branch_staff', 'admin', 'driver'), updateOrderStatus);
 router.patch('/:id/cancel', protect, cancelOrder);
 router.post('/:id/rate', protect, rateOrder);

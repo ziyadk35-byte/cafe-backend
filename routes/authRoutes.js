@@ -2,6 +2,7 @@ const express = require('express');
 const {
   register,
   login,
+  googleLogin,
   me,
   verifyOtp,
   resendOtp,
@@ -22,6 +23,7 @@ router.post('/resend-otp', resendOtp);
 router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
 router.post('/login', login);
+router.post('/google', googleLogin);
 router.get('/me', protect, me);
 router.post('/push-token', protect, registerPushToken);
 router.get('/addresses', protect, listAddresses);
