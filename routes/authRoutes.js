@@ -3,10 +3,7 @@ const {
   register,
   login,
   googleLogin,
-<<<<<<< HEAD
   guestCheckout,
-=======
->>>>>>> 8f92032be6b6286c524ac7aa5a2be551dfee9980
   me,
   verifyOtp,
   resendOtp,
@@ -28,10 +25,7 @@ router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
 router.post('/login', login);
 router.post('/google', googleLogin);
-<<<<<<< HEAD
 router.post('/guest-checkout', guestCheckout);
-=======
->>>>>>> 8f92032be6b6286c524ac7aa5a2be551dfee9980
 router.get('/me', protect, me);
 router.post('/push-token', protect, registerPushToken);
 router.get('/addresses', protect, listAddresses);
