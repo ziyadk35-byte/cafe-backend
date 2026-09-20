@@ -3,6 +3,7 @@ const {
   register,
   login,
   googleLogin,
+  guestCheckout,
   me,
   verifyOtp,
   resendOtp,
@@ -24,6 +25,7 @@ router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
 router.post('/login', login);
 router.post('/google', googleLogin);
+router.post('/guest-checkout', guestCheckout);
 router.get('/me', protect, me);
 router.post('/push-token', protect, registerPushToken);
 router.get('/addresses', protect, listAddresses);

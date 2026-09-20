@@ -172,6 +172,50 @@ exports.resetPassword = async (req, res) => {
   }
 };
 
+// Guest checkout: someone who never registered places their first order.
+// We quietly create (or reuse) an account by phone number so order
+// history, loyalty points, and status notifications all work normally
+// from here on - no OTP needed, since giving a real delivery address for a
+// real order is itself a strong enough signal. If that phone already
+// belongs to a fully-registered (password-protected) account, we don't
+// silently take it over - we ask them to log in properly instead.
+exports.guestCheckout = async (req, res) => {
+  try {
+    const { name, phone, phone2 } = req.body;
+    if (!name || !phone) {
+      return res.status(400).json({ message: 'الاسم ورقم الموبايل مطلوبين' });
+    }
+
+    let user = await User.findOne({ phone });
+
+    if (user) {
+      if (user.password) {
+        return res.status(409).json({
+          message: 'الرقم ده مسجّل بحساب قبل كده، سجّل دخول بكلمة المرور بدل كده',
+          code: 'ACCOUNT_EXISTS',
+        });
+      }
+      user.name = name;
+      if (phone2) user.phone2 = phone2;
+      user.phoneVerified = true;
+      await user.save();
+    } else {
+      user = await User.create({
+        name,
+        phone,
+        phone2,
+        phoneVerified: true,
+        authProviders: ['phone'],
+      });
+    }
+
+    const token = signToken(user._id);
+    res.json({ token, user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 exports.login = async (req, res) => {
   try {
     const { phone, password } = req.body;

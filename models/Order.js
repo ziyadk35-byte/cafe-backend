@@ -44,6 +44,10 @@ const orderSchema = new mongoose.Schema(
     },
     availableToBranchAt: { type: Date }, // when the cashier could first see/accept it (after online payment for Paymob)
     confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // cashier/admin who confirmed the order
+    // Cashier the new order was routed/notified to (picked automatically -
+    // prefers a cashier not already handling another order). The order
+    // still shows up for every cashier in the branch either way.
+    assignedCashier: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     confirmedAt: { type: Date },
     preparingAt: { type: Date },
     preparingBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
