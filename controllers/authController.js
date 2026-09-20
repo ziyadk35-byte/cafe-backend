@@ -167,6 +167,7 @@ exports.resetPassword = async (req, res) => {
 
     const token = signToken(user._id);
     res.json({ token, user: publicUser(user) });
+<<<<<<< HEAD
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -211,6 +212,8 @@ exports.guestCheckout = async (req, res) => {
 
     const token = signToken(user._id);
     res.json({ token, user: publicUser(user) });
+=======
+>>>>>>> 8f92032be6b6286c524ac7aa5a2be551dfee9980
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
